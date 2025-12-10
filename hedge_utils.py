@@ -3,12 +3,14 @@ import pandas as pd
 import numpy as np
 from typing import Optional
 from pandas.tseries.offsets import MonthEnd
+from urllib.request import urlopen
+import csv
 
 
 # --------------------------------------------------------------
 # 1. DATA LOADERS
 #    - US 2Y/5Y: FRED (daily -> monthly average)
-#    - AUD 2Y/5Y: RBA F2.1 (already monthly, no averaging)
+#    - AUD 2Y/5Y: RBA F2.1 (monthly, manual CSV parsing)
 # --------------------------------------------------------------
 
 def _to_monthly_average(df: pd.DataFrame, date_col: str, value_col: str) -> pd.DataFrame:
@@ -68,55 +70,79 @@ def get_aud_yield_monthly(tenor: str) -> pd.DataFrame:
     """
     Australian Government 2Y / 5Y from RBA F2.1 CSV → monthly series.
 
-    From f2.1-data.csv:
+    We avoid pandas.read_csv on the RBA URL to bypass C-engine tokenizing issues.
 
-      - Column 0: dates (31-May-2013, 30-Jun-2013, ..., 31-Oct-2025)
+    RBA f2.1-data.csv structure (relevant part):
+
+      - Column 0: dates (e.g. '31-May-13', '30-Jun-13', ...)
       - Column 1: 2-year yield   (FCMYGBAG2)
       - Column 3: 5-year yield   (FCMYGBAG5)
 
-    We:
+    Parsing logic:
 
-      - read the whole file (no header, latin1 encoding)
-      - parse column 0 as dates, column 1 or 3 as yields
-      - keep only rows where both date & yield are not NaN
-      - convert Date to month-end (Year/Month + MonthEnd)
-      - NO averaging: Yield values are exactly what’s in the file.
+      - Download CSV text via urllib
+      - Use Python's csv.reader to iterate lines
+      - Collect (date_string, value_string) pairs from column 0 and the tenor column
+      - Use pandas.to_datetime(..., errors='coerce', dayfirst=True) for dates
+      - Use pandas.to_numeric(..., errors='coerce') for yields
+      - Keep only rows with valid Date & Yield
+      - Force Date to month-end; deduplicate by last value per month
 
     Returns DataFrame(Date, Yield) with one row per month, Yield in percent.
     """
     tenor = tenor.upper()
-    col_map = {"2Y": 1, "5Y": 3}  # B=2Y, D=5Y in your actual file layout
+    col_map = {"2Y": 1, "5Y": 3}  # B=2Y, D=5Y in RBA table
     if tenor not in col_map:
         raise ValueError("Unsupported tenor for AUD: use '2Y' or '5Y'.")
 
+    value_idx = col_map[tenor]
     url = "https://www.rba.gov.au/statistics/tables/csv/f2.1-data.csv"
-    df = pd.read_csv(url, header=None, encoding="latin1")
 
-    value_col_idx = col_map[tenor]
-    if value_col_idx >= df.shape[1]:
-        raise ValueError(
-            f"Expected yield column index {value_col_idx} not in CSV (columns={df.shape[1]})."
-        )
+    # Fetch raw CSV text
+    resp = urlopen(url)
+    text = resp.read().decode("latin1")
 
-    # Parse dates and yields directly
-    dates = pd.to_datetime(df.iloc[:, 0], errors="coerce", dayfirst=True)
-    yields = pd.to_numeric(df.iloc[:, value_col_idx], errors="coerce")
+    date_strs = []
+    value_strs = []
 
-    mask = dates.notna() & yields.notna()
-    data = pd.DataFrame({"Date": dates[mask], "Yield": yields[mask]}).sort_values("Date")
+    for row in csv.reader(text.splitlines()):
+        if not row:
+            continue
+        # Some header lines may have fewer columns; skip those
+        if len(row) <= value_idx:
+            continue
 
-    # Force month-end index (file already uses month-end, this standardizes)
-    data["Date"] = data["Date"].dt.to_period("M").dt.to_timestamp("M")
+        date_str = row[0].strip()
+        val_str = row[value_idx].strip()
+
+        # Collect everything; we'll let pandas decide what's a real date/number
+        date_strs.append(date_str)
+        value_strs.append(val_str)
+
+    df = pd.DataFrame({"DateStr": date_strs, "YieldStr": value_strs})
+
+    # Flexible parsing: non-date rows become NaT
+    df["Date"] = pd.to_datetime(df["DateStr"], errors="coerce", dayfirst=True)
+    df["Yield"] = pd.to_numeric(df["YieldStr"], errors="coerce")
+
+    # Keep only valid date & yield
+    df = df.dropna(subset=["Date", "Yield"]).sort_values("Date")
+
+    if df.empty:
+        raise ValueError("No valid AUD yield rows parsed from RBA F2.1 CSV (after cleaning).")
+
+    # Force month-end index
+    df["Date"] = df["Date"].dt.to_period("M").dt.to_timestamp("M")
 
     # If duplicates for same month, take the last
-    data = (
-        data.groupby("Date", as_index=False)["Yield"]
+    df = (
+        df.groupby("Date", as_index=False)["Yield"]
         .last()
         .sort_values("Date")
         .reset_index(drop=True)
     )
 
-    return data
+    return df[["Date", "Yield"]]
 
 
 # --------------------------------------------------------------
