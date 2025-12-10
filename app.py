@@ -360,7 +360,7 @@ with half-life **{half_life_months} months**.
                     st.dataframe(df_changes_out, use_container_width=True)
 
                 st.caption(
-                    "AUD yields: RBA F2.1 (column B=2Y, D=5Y, one row per month). "
+                    "AUD yields: RBA F2.1 parsed manually (2Y=column B, 5Y=column D, one row per month). "
                     "US yields: FRED DGS2/DGS5 (daily → monthly average). "
                     "Aligned data uses only the months where both series have observations."
                 )
